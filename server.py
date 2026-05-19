@@ -11,13 +11,14 @@ import time
 import re
 from pathlib import Path
 from contextlib import asynccontextmanager
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from bilibili_api import user as bili_user, video as bili_video
+from bilibili_api import channel_series as bili_channel_series, user as bili_user, video as bili_video
 
 from summarize import extract_bvid, get_uid_by_name, get_user_videos, get_favorite_videos, sanitize_filename
 
@@ -100,6 +101,116 @@ _BVID_RE = re.compile(r"\*\*BV号\*\*:\s*(BV[0-9A-Za-z]+)")
 _TITLE_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 _cover_cache: dict[str, str] = {}
 _MAX_COVER_LOOKUPS_PER_REQUEST = 40
+
+
+def _dedupe_bvids(bvids: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for bvid in bvids:
+        if bvid and bvid not in seen:
+            seen.add(bvid)
+            result.append(bvid)
+    return result
+
+
+def _page_url(bvid: str, page_index: int) -> str:
+    return f"https://www.bilibili.com/video/{bvid}?p={page_index + 1}"
+
+
+def _extract_bvids_from_payload(payload) -> list[str]:
+    bvids = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key.lower() == "bvid" and isinstance(value, str) and value.startswith("BV"):
+                bvids.append(value)
+            else:
+                bvids.extend(_extract_bvids_from_payload(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            bvids.extend(_extract_bvids_from_payload(item))
+    return _dedupe_bvids(bvids)
+
+
+def _int_query_param(query: dict[str, list[str]], *names: str) -> int | None:
+    for name in names:
+        values = query.get(name)
+        if values:
+            try:
+                return int(values[0])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+async def _fetch_channel_bvids(channel_id: int, type_: bili_channel_series.ChannelSeriesType) -> list[str]:
+    channel = bili_channel_series.ChannelSeries(type_=type_, id_=channel_id, credential=deps.credential)
+    bvids = []
+
+    for page in range(1, 51):
+        data = await channel.get_videos(pn=page, ps=100)
+        page_bvids = _extract_bvids_from_payload(data)
+        before = len(bvids)
+        bvids = _dedupe_bvids(bvids + page_bvids)
+        if not page_bvids or len(bvids) == before:
+            break
+        if len(page_bvids) < 100:
+            break
+
+    return bvids
+
+
+async def _expand_bvid_url(raw_url: str, bvid: str) -> list[str]:
+    try:
+        v = bili_video.Video(bvid=bvid, credential=deps.credential)
+        info = await v.get_info()
+    except Exception:
+        return [bvid]
+
+    collection_bvids = _extract_bvids_from_payload(info.get("ugc_season"))
+    if collection_bvids:
+        return collection_bvids
+
+    try:
+        pages = await v.get_pages()
+    except Exception:
+        return [bvid]
+
+    if len(pages) > 1:
+        return [_page_url(bvid, index) for index in range(len(pages))]
+    return [bvid]
+
+
+async def _resolve_input_bvids(raw_url: str) -> list[str]:
+    raw_url = raw_url.strip()
+    if not raw_url:
+        return []
+
+    parsed = urlparse(raw_url)
+    query = parse_qs(parsed.query)
+    path = parsed.path.lower()
+
+    season_id = _int_query_param(query, "season_id", "seasonid")
+    series_id = _int_query_param(query, "series_id", "seriesid")
+    sid = _int_query_param(query, "sid")
+
+    if season_id is not None:
+        return await _fetch_channel_bvids(season_id, bili_channel_series.ChannelSeriesType.SEASON)
+    if series_id is not None:
+        return await _fetch_channel_bvids(series_id, bili_channel_series.ChannelSeriesType.SERIES)
+    if sid is not None and "collectiondetail" in path:
+        return await _fetch_channel_bvids(sid, bili_channel_series.ChannelSeriesType.SEASON)
+    if sid is not None and "seriesdetail" in path:
+        return await _fetch_channel_bvids(sid, bili_channel_series.ChannelSeriesType.SERIES)
+
+    bvid = extract_bvid(raw_url)
+    return await _expand_bvid_url(raw_url, bvid)
+
+
+async def _resolve_input_bvids_many(urls: list[str]) -> list[str]:
+    bvids = []
+    for url in urls:
+        bvids.extend(await _resolve_input_bvids(url))
+    return _dedupe_bvids(bvids)
 
 
 def _extract_summary_info(md_path: Path) -> tuple[str, str]:
@@ -289,8 +400,11 @@ async def read_summary(path: str):
 @app.post("/api/summarize/url")
 async def summarize_urls(req: SummarizeURLRequest):
     task_id = f"url-{int(time.time()*1000)}"
-    bvids = [extract_bvid(u) for u in req.urls]
-    bvids = [b for b in bvids if b]
+    try:
+        bvids = await _resolve_input_bvids_many(req.urls)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"解析链接失败: {e}"})
+
     if not bvids:
         return JSONResponse(status_code=400, content={"error": "无法解析任何 BV 号"})
 

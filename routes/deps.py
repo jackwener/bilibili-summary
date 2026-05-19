@@ -7,6 +7,7 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv, set_key
 import anthropic
@@ -33,14 +34,18 @@ load_dotenv(str(DATA_DIR / '.env.local'))
 # ---------------------------------------------------------------------------
 credential: Optional[Credential] = None
 ai_client: Optional[anthropic.AsyncAnthropic] = None
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "GLM-4-FlashX-250414")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "mimo-v2.5-pro")
+
+
+def clean_env_value(value: Optional[str]) -> str:
+    return (value or "").strip().strip("'\"")
 
 
 def init_credential():
     global credential
-    sessdata = os.getenv('BILIBILI_SESSION_TOKEN')
-    bili_jct = os.getenv('BILIBILI_BILI_JCT')
-    ac_time_value = os.getenv('BILIBILI_AC_TIME_VALUE')
+    sessdata = clean_env_value(os.getenv('BILIBILI_SESSION_TOKEN'))
+    bili_jct = clean_env_value(os.getenv('BILIBILI_BILI_JCT'))
+    ac_time_value = clean_env_value(os.getenv('BILIBILI_AC_TIME_VALUE'))
     if sessdata and bili_jct:
         credential = Credential(sessdata=sessdata, bili_jct=bili_jct, ac_time_value=ac_time_value or "")
         return True
@@ -49,10 +54,12 @@ def init_credential():
 
 def init_ai_client():
     global ai_client
-    ai_client = anthropic.AsyncAnthropic(
-        base_url=os.getenv('ANTHROPIC_BASE_URL'),
-        api_key=os.getenv('ANTHROPIC_AUTH_TOKEN')
-    )
+    base_url = clean_env_value(os.getenv('ANTHROPIC_BASE_URL'))
+    auth_token = clean_env_value(os.getenv('ANTHROPIC_AUTH_TOKEN')) or clean_env_value(os.getenv('MIMO_API_KEY'))
+    if 'xiaomimimo.com' in base_url:
+        ai_client = anthropic.AsyncAnthropic(base_url=base_url, auth_token=auth_token)
+    else:
+        ai_client = anthropic.AsyncAnthropic(base_url=base_url, api_key=auth_token)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +162,22 @@ def clear_retry_count(output_subdir: str, safe_title: str):
 # ---------------------------------------------------------------------------
 # Core processing (with progress callbacks)
 # ---------------------------------------------------------------------------
+def _page_index_from_url(url: str) -> int:
+    try:
+        p_values = parse_qs(urlparse(url).query).get("p")
+        if not p_values:
+            return 0
+        return max(int(p_values[0]) - 1, 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _target_to_url(target: str) -> str:
+    if target.startswith("http://") or target.startswith("https://"):
+        return target
+    return f"https://www.bilibili.com/video/{target}"
+
+
 async def process_single_video(url: str, model: str, output_subdir: str, task_id: str):
     """Process one video and send progress events."""
     bvid = extract_bvid(url)
@@ -163,15 +186,33 @@ async def process_single_video(url: str, model: str, output_subdir: str, task_id
         return None
 
     try:
+        page_index = _page_index_from_url(url)
         v = video.Video(bvid=bvid, credential=credential)
         info = await v.get_info()
-        title = info.get("title", bvid)
+        base_title = info.get("title", bvid)
+        title = base_title
         duration = info.get("duration", 0)
         cover_url = info.get("pic", "")
         owner = info.get("owner", {})
         author_name = owner.get("name", "")
         author_uid = owner.get("mid", 0)
-        url = f"https://www.bilibili.com/video/{bvid}"
+        pages = await v.get_pages()
+        if page_index >= len(pages):
+            message = f"分P序号超出范围: P{page_index + 1}/{len(pages)}"
+            await send_progress(task_id, "error", {
+                "title": base_title, "bvid": bvid, "message": message
+            })
+            return {"title": base_title, "status": "error", "message": message}
+        if len(pages) > 1:
+            page = pages[page_index]
+            part = (page.get("part") or "").strip()
+            title = f"{base_title} - P{page_index + 1}"
+            if part:
+                title = f"{title} {part}"
+            duration = page.get("duration") or duration
+            url = f"https://www.bilibili.com/video/{bvid}?p={page_index + 1}"
+        else:
+            url = f"https://www.bilibili.com/video/{bvid}"
 
         safe_title = sanitize_filename(title)
         normal_path = DATA_DIR / "summary" / output_subdir / f"{safe_title}.md"
@@ -183,6 +224,13 @@ async def process_single_video(url: str, model: str, output_subdir: str, task_id
                 "path": f"{output_subdir}/{safe_title}.md"
             })
             return {"title": title, "status": "skipped"}
+
+        if credential is None:
+            message = "未登录 Bilibili，无法读取字幕；请先扫码登录后重试"
+            await send_progress(task_id, "error", {
+                "title": title, "bvid": bvid, "message": message
+            })
+            return {"title": title, "status": "error", "message": message}
 
         if nosub_path.exists():
             retries = get_retry_count(output_subdir, safe_title)
@@ -200,7 +248,7 @@ async def process_single_video(url: str, model: str, output_subdir: str, task_id
 
         await send_progress(task_id, "processing", {"title": title, "bvid": bvid, "step": "获取字幕"})
 
-        subtitle_text, subtitle_raw = await get_subtitle(v)
+        subtitle_text, subtitle_raw = await get_subtitle(v, page_index=page_index, pages=pages)
 
         if subtitle_raw:
             save_ass(title, subtitle_raw, output_subdir)
@@ -247,7 +295,7 @@ async def run_batch(bvids: list[str], model: str, concurrency: int, output_subdi
 
     async def bounded(bvid):
         async with sem:
-            url = f"https://www.bilibili.com/video/{bvid}"
+            url = _target_to_url(bvid)
             try:
                 r = await process_single_video(url, model, output_subdir, task_id)
                 results.append(r)

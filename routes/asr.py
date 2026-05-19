@@ -145,8 +145,16 @@ async def asr_summarize(bvid: str, output_subdir: str = ""):
             # Step 4: Send to GLM-ASR for transcription
             yield f"data: {json.dumps({'step': 'asr', 'message': '语音识别中 (GLM-ASR)...'})}\n\n"
 
-            asr_endpoint = "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions"
-            api_key = os.getenv('ANTHROPIC_AUTH_TOKEN', '')
+            asr_endpoint = os.getenv(
+                'GLM_ASR_BASE_URL',
+                'https://open.bigmodel.cn/api/paas/v4/audio/transcriptions',
+            )
+            api_key = os.getenv('GLM_ASR_AUTH_TOKEN') or os.getenv('GLM_AUTH_TOKEN') or ''
+            if not api_key and 'bigmodel.cn' in os.getenv('ANTHROPIC_BASE_URL', ''):
+                api_key = os.getenv('ANTHROPIC_AUTH_TOKEN', '')
+            if not api_key:
+                yield f"data: {json.dumps({'step': 'error', 'message': '未配置 ASR Token。无字幕视频需要 GLM_ASR_AUTH_TOKEN；当前 Mimo 文本模型配置不能直接替代 GLM-ASR。'})}\n\n"
+                return
 
             # Write audio to temp file for conversion
             m4s_path = _new_temp_path(".m4s")

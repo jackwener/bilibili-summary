@@ -43,17 +43,20 @@ def sanitize_filename(title: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '_', title).strip()
 
 
-async def get_subtitle(v: video.Video) -> tuple[str, list]:
+async def get_subtitle(v: video.Video, page_index: int = 0, pages: list | None = None) -> tuple[str, list]:
     """获取视频字幕内容，返回 (纯文本, 原始字幕数据)"""
     try:
         # 首先获取视频分P信息以获取 cid
-        pages = await v.get_pages()
+        pages = pages if pages is not None else await v.get_pages()
         if not pages:
             print(f"  ⚠️ 无法获取视频分P信息")
             return "", []
+        if page_index < 0 or page_index >= len(pages):
+            print(f"  ⚠️ 分P序号超出范围: {page_index + 1}/{len(pages)}")
+            return "", []
         
-        # 使用第一个分P的 cid
-        cid = pages[0].get('cid')
+        # 使用指定分P的 cid
+        cid = pages[page_index].get('cid')
         if not cid:
             print(f"  ⚠️ 无法获取 cid")
             return "", []
@@ -158,7 +161,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "GLM-4-FlashX-250414")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "mimo-v2.5-pro")
+
+
+def clean_env_value(value: str | None) -> str:
+    return (value or "").strip().strip("'\"")
+
+
+def extract_message_text(message) -> str:
+    texts = []
+    for block in getattr(message, "content", []) or []:
+        text = getattr(block, "text", None)
+        if text:
+            texts.append(text)
+        elif isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+            texts.append(block["text"])
+    return "\n".join(texts).strip()
 
 
 async def summarize_with_claude(subtitle: str, title: str, client: anthropic.AsyncAnthropic, model: str = None) -> tuple[str, float]:
@@ -199,16 +217,23 @@ async def summarize_with_claude(subtitle: str, title: str, client: anthropic.Asy
     for attempt in range(max_retries):
         try:
             t_start = time.time()
-            message = await client.messages.create(
-                model=model,
-                max_tokens=8192,
-                messages=[
+            create_kwargs = {
+                "model": model,
+                "max_tokens": 8192,
+                "messages": [
                     {"role": "user", "content": prompt}
-                ]
-            )
+                ],
+            }
+            if "xiaomimimo.com" in str(getattr(client, "base_url", "")):
+                create_kwargs["thinking"] = {"type": "disabled"}
+
+            message = await client.messages.create(**create_kwargs)
             t_end = time.time()
             duration = t_end - t_start
-            return message.content[0].text, duration
+            text = extract_message_text(message)
+            if not text:
+                return "⚠️ 生成总结失败: 模型未返回正文", duration
+            return text, duration
             
         except anthropic.RateLimitError as e:
             if attempt < max_retries - 1:
@@ -324,6 +349,10 @@ async def process_video(url: str, client: anthropic.AsyncAnthropic, credential: 
                 return
 
         print(f"  📌 标题: {title}")
+
+        if credential is None:
+            print("  ❌ 未登录 Bilibili，无法获取字幕。请先运行 python summarize.py --login 或在应用内扫码登录。")
+            return
         
         # 获取字幕
         print(f"  📝 获取字幕...")
@@ -566,10 +595,12 @@ async def main():
         print("⚠️ 未配置 BILIBILI_SESSION_TOKEN，可能无法获取字幕")
     
     # 初始化 Anthropic 客户端
-    client = anthropic.AsyncAnthropic(
-        base_url=os.getenv('ANTHROPIC_BASE_URL'),
-        api_key=os.getenv('ANTHROPIC_AUTH_TOKEN')
-    )
+    base_url = clean_env_value(os.getenv('ANTHROPIC_BASE_URL'))
+    auth_token = clean_env_value(os.getenv('ANTHROPIC_AUTH_TOKEN')) or clean_env_value(os.getenv('MIMO_API_KEY'))
+    if 'xiaomimimo.com' in base_url:
+        client = anthropic.AsyncAnthropic(base_url=base_url, auth_token=auth_token)
+    else:
+        client = anthropic.AsyncAnthropic(base_url=base_url, api_key=auth_token)
     
     # 初始化信号量
     concurrency = 1 if args.benchmark else args.concurrency  # Benchmark 模式下强制串行
